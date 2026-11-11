@@ -1,0 +1,17 @@
+# Build output
+build/
+dist/
+*.spec
+build.log
+__pycache__/
+
+# Third-party binaries (bundled only inside the release executable)
+payload/emulator/
+payload/extractor/
+
+# Generated icon
+assets/app.ico
+assets/banner.png
+
+# Original cover artwork with third-party marks (only the cleaned version is committed)
+assets/cover_source.jpg

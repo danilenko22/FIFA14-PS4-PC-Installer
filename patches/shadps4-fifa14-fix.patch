@@ -1,0 +1,641 @@
+diff --git a/fifa14-patches/FIFA14-fix/FIFA14.xml b/fifa14-patches/FIFA14-fix/FIFA14.xml
+new file mode 100644
+index 00000000..132368b1
+--- /dev/null
++++ b/fifa14-patches/FIFA14-fix/FIFA14.xml
+@@ -0,0 +1,33 @@
++<?xml version="1.0" encoding="utf-8"?>
++<Patch>
++    <!-- FIFA 14 (CUSA00128, EUR) v01.06.
++         The eboot is linked at 0x400000 and shadPS4 maps it at base + p_vaddr, while patch
++         addresses are applied as base + (Address - 0x400000), so Address = ELF address + 0x400000. -->
++    <Metadata Title="FIFA 14"
++              Name="60 FPS in replays and cutscenes"
++              Note="Keeps replays and cutscenes at 60 FPS. ELF 0xE88A34: flip interval clamp 3 -> 1. ELF 0xE27B97 / 0xE27B9F: end of frame wait for intervals 3 and 2, 50 / 33 ms -> 16 ms."
++              Author="danilenko22"
++              PatchVer="1.2"
++              AppVer="01.06"
++              AppElf="eboot.bin"
++              isEnabled="true">
++        <PatchList>
++            <Line Type="bytes" Address="0x1288A35" Value="01"/>
++            <Line Type="bytes" Address="0x1288A3B" Value="01"/>
++            <Line Type="bytes" Address="0x1227B99" Value="10"/>
++            <Line Type="bytes" Address="0x1227BA1" Value="10"/>
++        </PatchList>
++    </Metadata>
++    <Metadata Title="FIFA 14"
++              Name="Scene limiter 40 -> 60"
++              Note="Raises the 40 Hz scene scheduler limiter (ELF 0x401D03, call at 0x401D08) to 60 Hz."
++              Author="danilenko22"
++              PatchVer="1.1"
++              AppVer="01.06"
++              AppElf="eboot.bin"
++              isEnabled="true">
++        <PatchList>
++            <Line Type="bytes" Address="0x801D04" Value="3C"/>
++        </PatchList>
++    </Metadata>
++</Patch>
+diff --git a/fifa14-patches/FIFA14-fix/files.json b/fifa14-patches/FIFA14-fix/files.json
+new file mode 100644
+index 00000000..e1a71dbe
+--- /dev/null
++++ b/fifa14-patches/FIFA14-fix/files.json
+@@ -0,0 +1,3 @@
++{
++    "FIFA14.xml": ["CUSA00128"]
++}
+diff --git a/src/core/devtools/layer.cpp b/src/core/devtools/layer.cpp
+index da64436f..27ebd4be 100644
+--- a/src/core/devtools/layer.cpp
++++ b/src/core/devtools/layer.cpp
+@@ -6,6 +6,9 @@
+ #include <SDL3/SDL_events.h>
+ #include <imgui.h>
+ 
++#include <algorithm>
++#include <optional>
++
+ #include "SDL3/SDL_log.h"
+ #include "common/singleton.h"
+ #include "common/types.h"
+@@ -291,6 +294,8 @@ void L::DrawSimple() {
+     PopStyleColor();
+ }
+ 
++static std::optional<float> saved_pp_gamma;
++
+ static void LoadSettings(const char* line) {
+     int i;
+     float f;
+@@ -298,6 +303,10 @@ static void LoadSettings(const char* line) {
+         fps_scale = f;
+         return;
+     }
++    if (sscanf(line, "pp_gamma=%f", &f) == 1) {
++        saved_pp_gamma = std::clamp(f, 0.1f, 2.0f);
++        return;
++    }
+     if (sscanf(line, "show_advanced_debug=%d", &i) == 1) {
+         DebugState.IsShowingDebugMenuBar() = i != 0;
+         return;
+@@ -362,6 +371,9 @@ void L::SetupSettings() {
+     handler.WriteAllFn = [](ImGuiContext*, ImGuiSettingsHandler* handler, ImGuiTextBuffer* buf) {
+         buf->appendf("[%s][Data]\n", handler->TypeName);
+         buf->appendf("fps_scale=%f\n", fps_scale);
++        if (presenter) {
++            buf->appendf("pp_gamma=%f\n", presenter->GetPPSettingsRef().gamma);
++        }
+         buf->appendf("show_advanced_debug=%d\n", DebugState.IsShowingDebugMenuBar());
+         buf->appendf("show_frame_graph=%d\n", frame_graph.is_open);
+         buf->appendf("show_shader_list=%d\n", shader_list.open);
+@@ -394,6 +406,11 @@ void L::Draw() {
+     const auto io = GetIO();
+     PushID("DevtoolsLayer");
+ 
++    if (saved_pp_gamma && presenter) {
++        presenter->GetPPSettingsRef().gamma = *saved_pp_gamma;
++        saved_pp_gamma.reset();
++    }
++
+     if (!DebugState.IsGuestThreadsPaused()) {
+         const auto fn = DebugState.flip_frame_count.load();
+         frame_graph.AddFrame(fn, DebugState.FrameDeltaTime);
+diff --git a/src/core/emulator_settings.h b/src/core/emulator_settings.h
+index f36308af..cd199660 100644
+--- a/src/core/emulator_settings.h
++++ b/src/core/emulator_settings.h
+@@ -430,10 +430,15 @@ struct GPUSettings {
+     Setting<int> rcas_attenuation{250};
+     Setting<bool> userfaultfd{false};
+     Setting<bool> inline_fetch_shader{false};
++    Setting<bool> ignore_flip_rate{false};
++    Setting<u32> occlusion_counter_step{0x2FFFFFF};
+ 
+     std::vector<OverrideItem> GetOverrideableFields() const {
+         return std::vector<OverrideItem>{
+             make_override<GPUSettings>("null_gpu", &GPUSettings::null_gpu),
++            make_override<GPUSettings>("ignore_flip_rate", &GPUSettings::ignore_flip_rate),
++            make_override<GPUSettings>("occlusion_counter_step",
++                                       &GPUSettings::occlusion_counter_step),
+             make_override<GPUSettings>("copy_gpu_buffers", &GPUSettings::copy_gpu_buffers),
+             make_override<GPUSettings>("full_screen", &GPUSettings::full_screen),
+             make_override<GPUSettings>("full_screen_mode", &GPUSettings::full_screen_mode),
+@@ -741,6 +746,8 @@ public:
+     SETTING_FORWARD_BOOL(m_gpu, NullGPU, null_gpu)
+     SETTING_FORWARD_BOOL(m_gpu, DumpShaders, dump_shaders)
+     SETTING_FORWARD_BOOL(m_gpu, CopyGpuBuffers, copy_gpu_buffers)
++    SETTING_FORWARD_BOOL(m_gpu, IgnoreFlipRate, ignore_flip_rate)
++    SETTING_FORWARD(m_gpu, OcclusionCounterStep, occlusion_counter_step)
+     SETTING_FORWARD_BOOL(m_gpu, FullScreen, full_screen)
+     SETTING_FORWARD(m_gpu, FullScreenMode, full_screen_mode)
+     SETTING_FORWARD(m_gpu, PresentMode, present_mode)
+diff --git a/src/core/libraries/app_content/app_content.cpp b/src/core/libraries/app_content/app_content.cpp
+index 72db82a4..8928d705 100644
+--- a/src/core/libraries/app_content/app_content.cpp
++++ b/src/core/libraries/app_content/app_content.cpp
+@@ -455,8 +455,14 @@ int PS4_SYSV_ABI sceAppContentTemporaryDataGetAvailableSpaceKb(
+     return ORBIS_OK;
+ }
+ 
+-int PS4_SYSV_ABI sceAppContentTemporaryDataMount() {
+-    LOG_ERROR(Lib_AppContent, "(STUBBED) called");
++int PS4_SYSV_ABI sceAppContentTemporaryDataMount(OrbisAppContentMountPoint* mountPoint) {
++    if (mountPoint == nullptr) {
++        return ORBIS_APP_CONTENT_ERROR_PARAMETER;
++    }
++    static constexpr std::string_view TmpMount = "/temp0";
++    TmpMount.copy(mountPoint->data, TmpMount.size());
++    mountPoint->data[TmpMount.size()] = '\0';
++    LOG_INFO(Lib_AppContent, "sceAppContentTemporaryDataMount: mountPoint = {}", mountPoint->data);
+     return ORBIS_OK;
+ }
+ 
+diff --git a/src/core/libraries/app_content/app_content.h b/src/core/libraries/app_content/app_content.h
+index dd8455dc..43839101 100644
+--- a/src/core/libraries/app_content/app_content.h
++++ b/src/core/libraries/app_content/app_content.h
+@@ -108,7 +108,7 @@ int PS4_SYSV_ABI sceAppContentSmallSharedDataUnmount();
+ int PS4_SYSV_ABI sceAppContentTemporaryDataFormat();
+ int PS4_SYSV_ABI sceAppContentTemporaryDataGetAvailableSpaceKb(
+     const OrbisAppContentMountPoint* mountPoint, u64* availableSpaceKb);
+-int PS4_SYSV_ABI sceAppContentTemporaryDataMount();
++int PS4_SYSV_ABI sceAppContentTemporaryDataMount(OrbisAppContentMountPoint* mountPoint);
+ int PS4_SYSV_ABI sceAppContentTemporaryDataMount2(OrbisAppContentTemporaryDataOption option,
+                                                   OrbisAppContentMountPoint* mountPoint);
+ int PS4_SYSV_ABI sceAppContentTemporaryDataUnmount();
+diff --git a/src/core/libraries/videoout/video_out.cpp b/src/core/libraries/videoout/video_out.cpp
+index 1cf6d2a8..37673a9c 100644
+--- a/src/core/libraries/videoout/video_out.cpp
++++ b/src/core/libraries/videoout/video_out.cpp
+@@ -139,8 +139,9 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
+ }
+ 
+ s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
+-    LOG_TRACE(Lib_VideoOut, "called");
+-    driver->GetPort(handle)->flip_rate = rate;
++    const bool ignore = EmulatorSettings.IsIgnoreFlipRate();
++    LOG_INFO(Lib_VideoOut, "handle = {}, rate = {}{}", handle, rate, ignore ? " (ignored)" : "");
++    driver->GetPort(handle)->flip_rate = ignore ? 0 : rate;
+     return ORBIS_OK;
+ }
+ 
+@@ -401,6 +402,7 @@ s32 PS4_SYSV_ABI sceVideoOutAdjustColor(s32 handle, const SceVideoOutColorSettin
+         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
+     }
+ 
++    LOG_INFO(Lib_VideoOut, "handle = {}, gamma = {}", handle, settings->gamma);
+     presenter->GetPPSettingsRef().gamma = settings->gamma;
+     return ORBIS_OK;
+ }
+diff --git a/src/video_core/amdgpu/liverpool.cpp b/src/video_core/amdgpu/liverpool.cpp
+index 547ba8b5..c233f591 100644
+--- a/src/video_core/amdgpu/liverpool.cpp
++++ b/src/video_core/amdgpu/liverpool.cpp
+@@ -666,9 +666,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
+                     // immediately
+                     regs.cp_strmout_cntl.offset_update_done = 1;
+                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
+-                    if (event->event_type.Value() == EventType::PixelPipeStatDump) {
++                    if (event->event_type.Value() == EventType::PixelPipeStatDump && rasterizer) {
++                        rasterizer->DumpOcclusionCounters(event->Address<VAddr>(),
++                                                          num_counter_pairs);
++                    } else if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
+-                        static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
++                        const u64 OcclusionCounterStep = EmulatorSettings.GetOcclusionCounterStep();
+                         u64* results = event->Address<u64*>();
+                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
+                             *results = pixel_counter | OcclusionCounterValidMask;
+diff --git a/src/video_core/renderdoc.cpp b/src/video_core/renderdoc.cpp
+index 0fe7e9fc..66edb43b 100644
+--- a/src/video_core/renderdoc.cpp
++++ b/src/video_core/renderdoc.cpp
+@@ -15,6 +15,8 @@
+ #include <dlfcn.h>
+ #endif
+ 
++#include <algorithm>
++#include <cstdlib>
+ #include <filesystem>
+ 
+ namespace VideoCore {
+@@ -25,6 +27,7 @@ enum class CaptureState {
+     InProgress,
+ };
+ static CaptureState capture_state{CaptureState::Idle};
++static u32 capture_submits_left{0};
+ static std::atomic<u32> screenshot_game_only_count{0};
+ static std::atomic<u32> screenshot_with_overlays_count{0};
+ 
+@@ -99,6 +102,8 @@ void StartCapture() {
+     }
+ 
+     if (capture_state == CaptureState::Triggered) {
++        const char* submits = std::getenv("SHADPS4_RDOC_SUBMITS");
++        capture_submits_left = submits ? std::max(1, std::atoi(submits)) : 1;
+         rdoc_api->StartFrameCapture(nullptr, nullptr);
+         capture_state = CaptureState::InProgress;
+     }
+@@ -109,7 +114,7 @@ void EndCapture() {
+         return;
+     }
+ 
+-    if (capture_state == CaptureState::InProgress) {
++    if (capture_state == CaptureState::InProgress && --capture_submits_left == 0) {
+         rdoc_api->EndFrameCapture(nullptr, nullptr);
+         capture_state = CaptureState::Idle;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_instance.cpp b/src/video_core/renderer_vulkan/vk_instance.cpp
+index b3acd6e9..6f130d6c 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp
+@@ -405,6 +405,7 @@ bool Instance::CreateDevice() {
+                 .dualSrcBlend = features.dualSrcBlend,
+                 .logicOp = features.logicOp,
+                 .multiDrawIndirect = features.multiDrawIndirect,
++                .occlusionQueryPrecise = features.occlusionQueryPrecise,
+                 .depthClamp = features.depthClamp,
+                 .depthBiasClamp = features.depthBiasClamp,
+                 .fillModeNonSolid = features.fillModeNonSolid,
+diff --git a/src/video_core/renderer_vulkan/vk_instance.h b/src/video_core/renderer_vulkan/vk_instance.h
+index 621f020c..1e9a31fd 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.h
++++ b/src/video_core/renderer_vulkan/vk_instance.h
+@@ -84,6 +84,16 @@ public:
+         return features.samplerAnisotropy;
+     }
+ 
++    /// Returns true if occlusion queries can return exact sample counts
++    bool IsOcclusionQueryPreciseSupported() const {
++        return features.occlusionQueryPrecise;
++    }
++
++    /// Returns true if query pools can be reset from the host
++    bool IsHostQueryResetSupported() const {
++        return vk12_features.hostQueryReset;
++    }
++
+     /// Returns true if depth bounds testing is supported
+     bool IsDepthBoundsSupported() const {
+         return features.depthBounds;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 6a1a4a5c..481e25ae 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -13,6 +13,7 @@
+ #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
++#include "video_core/renderer_vulkan/vk_platform.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
+ #include "video_core/renderer_vulkan/vk_runtime.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+@@ -222,6 +223,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+ 
++    const bool counting_occlusion = BeginOcclusionQuery();
+     if (is_indexed) {
+         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
+                            s32(vertex_offset), instance_offset);
+@@ -229,6 +231,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
+                     instance_offset);
+     }
++    if (counting_occlusion) {
++        EndOcclusionQuery();
++    }
+     DebugState.IncDrawCall();
+ 
+     ResetBindings(false);
+@@ -291,6 +296,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+ 
++    const bool counting_occlusion = BeginOcclusionQuery();
+     if (is_indexed) {
+         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
+ 
+@@ -312,10 +318,93 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
+         }
+         DebugState.IncDrawCall();
+     }
++    if (counting_occlusion) {
++        EndOcclusionQuery();
++    }
+ 
+     ResetBindings(false);
+ }
+ 
++bool Rasterizer::BeginOcclusionQuery() {
++    if (occlusion_begin_queries.empty() || !instance.IsHostQueryResetSupported()) {
++        return false;
++    }
++    const u32 pool_index = (next_occlusion_query / OcclusionQueriesPerPool) % NumOcclusionPools;
++    const u32 query = next_occlusion_query % OcclusionQueriesPerPool;
++    auto& pool = occlusion_pools[pool_index];
++    if (query == 0) {
++        const auto device = instance.GetDevice();
++        if (!pool) {
++            pool = Check<"create occlusion query pool">(device.createQueryPoolUnique({
++                .queryType = vk::QueryType::eOcclusion,
++                .queryCount = OcclusionQueriesPerPool,
++            }));
++        } else {
++            scheduler.Wait(occlusion_pool_ticks[pool_index]);
++        }
++        device.resetQueryPool(*pool, 0, OcclusionQueriesPerPool);
++    }
++    occlusion_pool_ticks[pool_index] = scheduler.CurrentTick();
++    const auto flags = instance.IsOcclusionQueryPreciseSupported()
++                           ? vk::QueryControlFlagBits::ePrecise
++                           : vk::QueryControlFlags{};
++    scheduler.CommandBuffer().beginQuery(*pool, query, flags);
++    return true;
++}
++
++void Rasterizer::EndOcclusionQuery() {
++    const u32 pool_index = (next_occlusion_query / OcclusionQueriesPerPool) % NumOcclusionPools;
++    const u32 query = next_occlusion_query % OcclusionQueriesPerPool;
++    scheduler.CommandBuffer().endQuery(*occlusion_pools[pool_index], query);
++    ++next_occlusion_query;
++}
++
++void Rasterizer::DumpOcclusionCounters(VAddr address, u32 num_counter_pairs) {
++    // Each counter pair is a begin and an end sample count; a dump to an end slot follows the
++    // dump to its begin slot, one u64 earlier.
++    static constexpr u64 CounterValid = 1ULL << 63;
++    static constexpr u32 CounterPairSize = 2 * sizeof(u64);
++    auto* counters = reinterpret_cast<u64*>(address);
++    const bool is_begin = address % CounterPairSize == 0;
++    for (u32 i = is_begin ? 0 : 1; i < num_counter_pairs; ++i) {
++        counters[i * 2] = CounterValid;
++    }
++    if (is_begin) {
++        occlusion_begin_queries[address] = next_occlusion_query;
++        return;
++    }
++
++    const auto it = occlusion_begin_queries.find(address - sizeof(u64));
++    if (it == occlusion_begin_queries.end() || it->second == next_occlusion_query) {
++        if (it != occlusion_begin_queries.end()) {
++            occlusion_begin_queries.erase(it);
++        }
++        counters[0] = CounterValid;
++        return;
++    }
++    const u32 first_query = it->second;
++    const u32 last_query = next_occlusion_query;
++    occlusion_begin_queries.erase(it);
++
++    // Keep the previous result readable until the new one is resolved.
++    counters[0] |= CounterValid;
++    scheduler.DeferPriorityOperation([this, counters, first_query, last_query] {
++        u64 samples = 0;
++        for (u32 q = first_query; q < last_query; ++q) {
++            const u32 pool_index = (q / OcclusionQueriesPerPool) % NumOcclusionPools;
++            u64 value = 0;
++            const auto result = instance.GetDevice().getQueryPoolResults(
++                *occlusion_pools[pool_index], q % OcclusionQueriesPerPool, 1, sizeof(value),
++                &value, sizeof(value),
++                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
++            if (result == vk::Result::eSuccess) {
++                samples += value;
++            }
++        }
++        counters[0] = samples | CounterValid;
++    });
++}
++
+ void Rasterizer::DispatchDirect() {
+     RENDERER_TRACE;
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index e01715c5..4c07fe9c 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -3,6 +3,8 @@
+ 
+ #pragma once
+ 
++#include <unordered_map>
++
+ #include "common/recursive_lock.h"
+ #include "common/shared_first_mutex.h"
+ #include "video_core/buffer_cache/buffer_cache.h"
+@@ -53,6 +55,8 @@ public:
+     void DispatchDirect();
+     void DispatchIndirect(VAddr address, u32 offset, u32 size);
+ 
++    void DumpOcclusionCounters(VAddr address, u32 num_counter_pairs);
++
+     void ScopeMarker(fmt::string_view fmt, fmt::format_args args, auto&& func) {
+         if (host_markers_enabled) {
+             ScopeMarkerBegin(fmt::vformat(fmt, args));
+@@ -118,6 +122,9 @@ private:
+ 
+     bool FilterDraw();
+ 
++    bool BeginOcclusionQuery();
++    void EndOcclusionQuery();
++
+     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                      Shader::PushData& push_data);
+     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+@@ -175,6 +182,13 @@ private:
+ 
+     bool attachment_feedback_loop{};
+     bool needs_barrier{};
++
++    static constexpr u32 OcclusionQueriesPerPool = 1024;
++    static constexpr u32 NumOcclusionPools = 16;
++    std::array<vk::UniqueQueryPool, NumOcclusionPools> occlusion_pools;
++    std::array<u64, NumOcclusionPools> occlusion_pool_ticks{};
++    std::unordered_map<VAddr, u32> occlusion_begin_queries;
++    u32 next_occlusion_query{};
+ };
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_runtime.cpp b/src/video_core/renderer_vulkan/vk_runtime.cpp
+index 7e1c025a..ef836f09 100644
+--- a/src/video_core/renderer_vulkan/vk_runtime.cpp
++++ b/src/video_core/renderer_vulkan/vk_runtime.cpp
+@@ -388,9 +388,12 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
+     const auto mip_block_p = std::max<u32>(dst->info.mips_layout[mip].pitch >> dst_dim, 1u);
+ 
+     const auto src_dim = src->info.props.is_block ? 2 : 0;
+-    ASSERT(mip_block_w == (src->info.size.width >> src_dim));
+-    ASSERT(mip_block_h == (src->info.size.height >> src_dim));
++    // Small mips may be rendered with their tile padded extent, only the mip extent is copied.
++    ASSERT(mip_block_w <= (src->info.size.width >> src_dim));
++    ASSERT(mip_block_h <= (src->info.size.height >> src_dim));
+     ASSERT(mip_block_p == (src->info.pitch >> src_dim));
++    const auto mip_w = std::max(dst->info.size.width >> mip, 1u);
++    const auto mip_h = std::max(dst->info.size.height >> mip, 1u);
+ 
+     const auto [src_layers, dst_layers] =
+         SanitizeCopyLayers(src->info, dst->info, src->info.size.depth);
+@@ -408,7 +411,8 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
+             .baseArrayLayer = slice,
+             .layerCount = dst_layers,
+         },
+-        .extent = {src->info.size.width, src->info.size.height, src->info.size.depth},
++        .extent = {std::min(src->info.size.width, mip_w), std::min(src->info.size.height, mip_h),
++                   src->info.size.depth},
+     };
+ 
+     SetBackingSamples(dst, dst->info.num_samples);
+diff --git a/src/video_core/texture_cache/image_info.cpp b/src/video_core/texture_cache/image_info.cpp
+index 51a9d88c..1c41d507 100644
+--- a/src/video_core/texture_cache/image_info.cpp
++++ b/src/video_core/texture_cache/image_info.cpp
+@@ -192,12 +192,24 @@ void ImageInfo::UpdateSize() noexcept {
+                      &guest_size, &micro_tiled_mips, mips_layout.data());
+ }
+ 
+-s32 ImageInfo::MipOf(const ImageInfo& info) const {
+-    if (!IsCompatible(info)) {
+-        return -1;
++bool ImageInfo::MatchesMipExtent(const ImageInfo& info, s32 mip, bool allow_padded) const {
++    const auto info_dim = info.props.is_block ? 2 : 0;
++    const auto this_dim = props.is_block ? 2 : 0;
++    const auto mip_w = std::max(info.size.width >> (mip + info_dim), 1u);
++    const auto mip_h = std::max(info.size.height >> (mip + info_dim), 1u);
++    const auto this_w = std::max(size.width >> this_dim, 1u);
++    const auto this_h = std::max(size.height >> this_dim, 1u);
++    if (this_w == mip_w && this_h == mip_h) {
++        return true;
+     }
++    // A small mip can be bound with the extent it is padded to in memory.
++    const auto& layout = info.mips_layout[mip];
++    return allow_padded && this_w == (layout.pitch >> info_dim) &&
++           this_h == (layout.height >> info_dim);
++}
+ 
+-    if (info.array_mode != array_mode) {
++s32 ImageInfo::MipOf(const ImageInfo& info, bool allow_padded) const {
++    if (!IsCompatible(info)) {
+         return -1;
+     }
+ 
+@@ -209,6 +221,17 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
+     const auto info_dim = info.props.is_block ? 2 : 0;
+     const auto this_dim = props.is_block ? 2 : 0;
+ 
++    // Macro tiled thin images degrade small mips to 1D tiling, so a mip may be bound on its own
++    // with a different array mode than the full image.
++    const auto is_array_mode_compatible = [&](u32 m) {
++        if (info.array_mode == array_mode) {
++            return true;
++        }
++        const bool degraded_mip = (info.micro_tiled_mips & (1u << m)) != 0;
++        return degraded_mip && array_mode == AmdGpu::ArrayMode::Array1DTiledThin1 &&
++               AmdGpu::GetMicroTileThickness(info.array_mode) == 1;
++    };
++
+     // Find mip
+     auto mip = -1;
+     for (auto m = 0; m < info.resources.levels; ++m) {
+@@ -216,7 +239,7 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
+         const VAddr mip_base = info.guest_address + mip_ofs;
+         const VAddr mip_end = mip_base + mip_size;
+         const u32 slice_size = mip_size / info.resources.layers;
+-        if (guest_address >= mip_base && guest_address < mip_end &&
++        if (is_array_mode_compatible(m) && guest_address >= mip_base && guest_address < mip_end &&
+             (guest_address - mip_base) % slice_size == 0 &&
+             (pitch >> this_dim) == (mip_pitch >> info_dim)) {
+             mip = m;
+@@ -229,11 +252,7 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
+     }
+ 
+     // 2D block dimensions of both images should be the same.
+-    const auto mip_w = std::max(info.size.width >> (mip + info_dim), 1u);
+-    const auto mip_h = std::max(info.size.height >> (mip + info_dim), 1u);
+-    const auto this_w = std::max(size.width >> this_dim, 1u);
+-    const auto this_h = std::max(size.height >> this_dim, 1u);
+-    if ((this_w != mip_w) || (this_h != mip_h)) {
++    if (!MatchesMipExtent(info, mip, allow_padded)) {
+         return -1;
+     }
+ 
+@@ -252,7 +271,7 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
+     return mip;
+ }
+ 
+-s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
++s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip, bool allow_padded) const {
+     if (!IsCompatible(info)) {
+         return -1;
+     }
+@@ -264,15 +283,10 @@ s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
+ 
+     // 2D block dimensions of both images should be the same.
+     const auto info_dim = info.props.is_block ? 2 : 0;
+-    const auto mip_w = std::max(info.size.width >> (mip + info_dim), 1u);
+-    const auto mip_h = std::max(info.size.height >> (mip + info_dim), 1u);
+     const auto mip_p = std::max<u32>(info.mips_layout[mip].pitch >> info_dim, 1u);
+-
+     const auto this_dim = props.is_block ? 2 : 0;
+-    const auto this_w = std::max(size.width >> this_dim, 1u);
+-    const auto this_h = std::max(size.height >> this_dim, 1u);
+     const auto this_p = std::max(pitch >> this_dim, 1u);
+-    if ((this_w != mip_w) || (this_h != mip_h) || (this_p != mip_p)) {
++    if (!MatchesMipExtent(info, mip, allow_padded) || (this_p != mip_p)) {
+         return -1;
+     }
+ 
+diff --git a/src/video_core/texture_cache/image_info.h b/src/video_core/texture_cache/image_info.h
+index 0eb3b124..f9acdc28 100644
+--- a/src/video_core/texture_cache/image_info.h
++++ b/src/video_core/texture_cache/image_info.h
+@@ -53,8 +53,9 @@ struct ImageInfo {
+         return Extent2D{pitch >> dim, size.height >> dim};
+     }
+ 
+-    s32 MipOf(const ImageInfo& info) const;
+-    s32 SliceOf(const ImageInfo& info, s32 mip) const;
++    s32 MipOf(const ImageInfo& info, bool allow_padded = false) const;
++    s32 SliceOf(const ImageInfo& info, s32 mip, bool allow_padded = false) const;
++    bool MatchesMipExtent(const ImageInfo& info, s32 mip, bool allow_padded) const;
+ 
+     bool IsCompatible(const ImageInfo& info) const;
+     void UpdateSize() noexcept;
+diff --git a/src/video_core/texture_cache/texture_cache.cpp b/src/video_core/texture_cache/texture_cache.cpp
+index 1e7a23de..ee55ce65 100644
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -468,14 +468,16 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
+         return {{}, -1, -1};
+     } else {
+         // Left overlap, the image from cache is a possible subresource of the image requested
+-        if (auto mip = cache_image.info.MipOf(image_info); mip >= 0) {
+-            if (auto slice = cache_image.info.SliceOf(image_info, mip); slice >= 0) {
++        if (auto mip = cache_image.info.MipOf(image_info, true); mip >= 0) {
++            if (auto slice = cache_image.info.SliceOf(image_info, mip, true); slice >= 0) {
+                 // We have a larger image created and a separate one, representing a subres of it
+                 // bound as render target. In this case we need to rebind render target.
+                 if (cache_image.binding.is_target) {
+                     cache_image.binding.needs_rebind = 1u;
+                     if (merged_image_id) {
+-                        GetImage(merged_image_id).binding.is_target = 1u;
++                        auto& merged_image = GetImage(merged_image_id);
++                        merged_image.binding.is_target = 1u;
++                        runtime.CopyMip(&cache_image, &merged_image, mip, slice);
+                     }
+ 
+                     FreeImage(cache_image_id);
+@@ -522,6 +524,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+     ForEachImageInRegion(info.guest_address, info.guest_size,
+                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+ 
++    // Resolve overlaps from the lowest address, so an image at the requested address is merged
++    // before the subresources that have to be copied into it.
++    std::ranges::stable_sort(image_ids, {}, [&](ImageId id) {
++        return slot_images[id].info.guest_address;
++    });
++
+     ImageId image_id{};
+ 
+     // Check for a perfect match first

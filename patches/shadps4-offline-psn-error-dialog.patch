@@ -1,0 +1,28 @@
+diff --git a/src/core/libraries/ime/error_dialog.cpp b/src/core/libraries/ime/error_dialog.cpp
+index 543ef0e5..45f4bfe0 100644
+--- a/src/core/libraries/ime/error_dialog.cpp
++++ b/src/core/libraries/ime/error_dialog.cpp
+@@ -8,8 +8,10 @@
+ 
+ #include "common/assert.h"
+ #include "common/logging/log.h"
++#include "core/emulator_settings.h"
+ #include "core/libraries/error_codes.h"
+ #include "core/libraries/libs.h"
++#include "core/libraries/np/np_error.h"
+ #include "core/libraries/system/commondialog.h"
+ #include "error_dialog.h"
+ #include "imgui/imgui_layer.h"
+@@ -158,6 +160,12 @@ Error PS4_SYSV_ABI sceErrorDialogOpen(const Param* param) {
+     LOG_DEBUG(Lib_ErrorDialog, "called param->errorCode = {:#x}", err);
+     ASSERT(param->size == sizeof(Param));
+ 
++    if (err == static_cast<u32>(ORBIS_NP_ERROR_SIGNED_OUT) && !EmulatorSettings.IsShadNetEnabled()) {
++        LOG_INFO(Lib_ErrorDialog, "offline mode: auto-accepting PSN signed-out error dialog");
++        g_status = Status::FINISHED;
++        return Error::OK;
++    }
++
+     const std::string err_message = fmt::format("An error has occurred. \nCode: {:#X}", err);
+     g_status = Status::RUNNING;
+     g_dialog_ui = ErrorDialogUi{&g_status, err_message};
